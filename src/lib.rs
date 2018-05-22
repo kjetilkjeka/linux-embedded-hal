@@ -15,9 +15,11 @@
 
 extern crate cast;
 extern crate embedded_hal as hal;
+extern crate nb;
 pub extern crate i2cdev;
 pub extern crate spidev;
 pub extern crate sysfs_gpio;
+pub extern crate socketcan;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -261,5 +263,185 @@ impl ops::Deref for Spidev {
 impl ops::DerefMut for Spidev {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// Newtype around [`socketcan::CANSocket`] that implements the `embedded-hal::can::Receiver` trait
+///
+/// [`socketcan::CANSocket`]: https://docs.rs/socketcan/1.7.0/socketcan/struct.CANSocket.html
+#[derive(Debug)]
+pub struct CanSocket(socketcan::CANSocket);
+
+/// Newtype around [`socketcan::CANFrame`] that implements the `embedded-hal` traits
+///
+/// [`socketcan::CANFrame`]: https://docs.rs/socketcan/1.7.0/socketcan/struct.CANFrane.html
+#[derive(Debug, Clone, Copy)]
+pub struct CanFrame(socketcan::CANFrame);
+
+/// Newtype around [`socketcan::CANFilter`] that implements the `embedded-hal` traits
+///
+/// [`socketcan::CANFilter`]: https://docs.rs/socketcan/1.7.0/socketcan/struct.CANFilter.html
+#[derive(Debug, Clone, Copy)]
+pub struct CanFilter(socketcan::CANFilter);
+
+/// A CAN-ID type
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CanId {
+    /// The CAN 11-bit ID
+    Base(u32),
+    /// The CAN 29-bit ID
+    Extended(u32),
+}
+
+impl From<socketcan::CANSocket> for CanSocket {
+    fn from(interface: socketcan::CANSocket) -> CanSocket {
+        interface.set_nonblocking(true).unwrap();
+        CanSocket(interface)
+    }
+}
+
+impl From<CanId> for u32 {
+    fn from(id: CanId) -> u32 {
+        match id {
+            CanId::Base(x) => x,
+            CanId::Extended(x) => x,
+        }
+    }
+}
+
+impl std::cmp::Ord for CanId {
+    // If numeric value of Id is the same BaseId will win aribtration and therefore sorted lower.
+    fn cmp(&self, other: &CanId) -> std::cmp::Ordering {
+        match (self, other) {
+            (&CanId::Base(ref self_id), &CanId::Base(ref other_id)) => std::cmp::Ord::cmp(self_id, other_id),
+            (&CanId::Extended(ref self_id), &CanId::Extended(ref other_id)) => std::cmp::Ord::cmp(self_id, other_id),
+            (&CanId::Base(ref self_id), &CanId::Extended(ref other_id)) => {
+                match std::cmp::Ord::cmp(self_id, other_id) {
+                    std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
+                    x => x
+                }
+            },
+            (&CanId::Extended(ref self_id), &CanId::Base(ref other_id)) => {
+                match std::cmp::Ord::cmp(self_id, other_id) {
+                    std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
+                    x => x
+                }
+            }
+        }
+    }
+}
+
+impl std::cmp::PartialOrd for CanId {
+    fn partial_cmp(&self, other: &CanId) -> Option<std::cmp::Ordering> {
+        Some(std::cmp::Ord::cmp(self, other))
+    }
+}
+
+impl hal::can::Id for CanId {
+    type BaseId = u32;
+    type ExtendedId = u32;
+
+    fn base_id(&self) -> Option<Self::BaseId> {
+        if let &CanId::Base(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    fn extended_id(&self) -> Option<Self::ExtendedId> {
+        if let &CanId::Extended(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
+impl hal::can::Filter for CanFilter {
+    type Id = CanId;
+
+    fn from_id(id: Self::Id) -> Self {
+        let id_socketcan = match id {
+            CanId::Base(id) => id,
+            CanId::Extended(id) => id | socketcan::EFF_FLAG,
+        };
+        let mask_socketcan = socketcan::EFF_MASK | socketcan::EFF_FLAG;
+
+        CanFilter(socketcan::CANFilter::new(id_socketcan, mask_socketcan).unwrap())
+    }
+
+    fn accept_all() -> Self {
+        CanFilter(socketcan::CANFilter::new(0, 0).unwrap())
+    }
+
+    fn from_mask(mask: u32, filter: u32) -> Self {
+        CanFilter(socketcan::CANFilter::new(mask, filter).unwrap())
+    }
+}
+
+impl hal::can::Frame for CanFrame {
+    type Id = CanId;
+
+    fn is_remote_frame(&self) -> bool {
+        self.0.is_rtr()
+    }
+
+    fn is_data_frame(&self) -> bool {
+        !self.0.is_error() && !self.0.is_rtr()
+    }
+
+    fn id(&self) -> CanId {
+        if self.0.is_extended() {
+            CanId::Extended(self.0.id())
+        } else {
+            CanId::Base(self.0.id())
+        }
+    }
+
+    fn data(&self) -> Option<&[u8]> {
+        if self.0.is_rtr() {
+            None
+        } else {
+            Some(self.0.data())
+        }
+    }
+}
+
+impl hal::can::Interface for CanSocket {
+    type Id = CanId;
+    type Frame = CanFrame;
+    type Error = std::io::Error;
+    type Filter = CanFilter;
+}
+
+impl hal::can::Receiver for CanSocket {
+    fn receive(&mut self) -> nb::Result<Self::Frame, Self::Error> {
+        Ok(CanFrame(self.0.read_frame().map_err(|e| {
+            match e.kind() {
+                std::io::ErrorKind::WouldBlock => nb::Error::WouldBlock,
+                _ => nb::Error::Other(e),
+            }
+        })?))
+    }
+
+    fn set_filter(&mut self, filter: Self::Filter) {
+        self.0.set_filter( &[filter.0] ).unwrap()
+    }
+
+    fn clear_filter(&mut self) {
+        self.0.filter_accept_all().unwrap()
+    }
+}
+
+impl hal::can::Transmitter for CanSocket {
+    fn transmit(&mut self, frame: &Self::Frame) -> Result<Option<Self::Frame>, nb::Error<Self::Error>> {
+        self.0.write_frame(&frame.0).map_err(|e| {
+            match e.kind() {
+                std::io::ErrorKind::WouldBlock => nb::Error::WouldBlock,
+                _ => nb::Error::Other(e),
+            }
+        })?;
+        Ok(None)
     }
 }

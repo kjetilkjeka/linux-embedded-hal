@@ -9,10 +9,12 @@ repository = "https://github.com/japaric/linux-embedded-hal"
 version = "0.2.0"
 
 [dependencies]
-embedded-hal = "0.2.0"
+embedded-hal = {git = "https://github.com/kjetilkjeka/embedded-hal.git", branch  = "can", features = ["unproven"]}
+nb = "0.1.1"
 i2cdev = "0.3.1"
 spidev = "0.3.0"
 sysfs_gpio = "0.5.1"
+socketcan = "1.7"
 
 [dependencies.cast]
 # we don't need the `Error` implementation
